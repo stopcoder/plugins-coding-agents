@@ -96,6 +96,49 @@ Read `references/build-and-test-commands.md`. Chrome DevTools MCP must be connec
 - **`pom.xml` exists** → Maven. Use §1.3 (`mvn clean verify -P execute.qunit ...`) for gates.
 - **No `pom.xml`** → npm. Use `package.json` scripts. Fallback: `npx @ui5/linter --details`.
 
+## Dashboard Progress Reporting
+
+Read `references/dashboard-status-api.md` at the start of the run. It documents the REST API endpoint, the full `ModernizationState` schema, and the initial phases array template.
+
+### Guard clause
+
+If the `curl` command to `http://localhost:3001/api/status` fails (connection refused, timeout, etc.), log a one-line note and continue. **Never retry failed calls. Never let a dashboard update failure interrupt the modernization workflow.** Dashboard reporting is best-effort — all dashboard instructions below are skipped silently when the server is unavailable.
+
+### How to push updates
+
+Use `curl` to POST a partial JSON state to the dashboard server:
+
+```bash
+curl -s -X POST http://localhost:3001/api/status \
+  -H "Content-Type: application/json" \
+  -d '<JSON object with fields to update>'
+```
+
+The server shallow-merges the payload into the existing state. Always include the full `phases[]` array in every call.
+
+### State management rules
+
+1. **Maintain the full 5-element `phases[]` array in working memory throughout the run.** Initialize it from the template in the reference file after Phase 0. Update individual elements as phases progress. Send the complete array with every status update (shallow merge replaces arrays entirely).
+2. **`overallProgress`** = `Math.round((findingsFixed / linterBaseline) * 100)`.
+3. **`elapsedSeconds`** — set to a rough estimate. The dashboard has a client-side timer that interpolates between updates, so precision is not required.
+4. **Only the orchestrator pushes status updates.** Sub-agents must NOT call the endpoint — they lack full state context and concurrent writes would corrupt the state file.
+
+### When to push updates
+
+Push status updates at these workflow points (and no others):
+
+| # | When | Key fields to set |
+|---|------|-------------------|
+| 1 | **Phase 0 complete** (after baseline analysis) | Full initial state: `status:"running"`, all preflight fields, `phases[]` all pending, `startedAt`, `findingsFixed:0`, `overallProgress:0` |
+| 2 | **Phase N starts** (before first step) | `phases[N-1].status:"running"`, `phases[N-1].findingsBefore`, `currentPhase:N`, `currentActivity:"Starting Phase N: <name>"`, `phaseStartedAt` |
+| 3 | **Sub-agent batch dispatched** (before blocking wait) | `currentActivity:"Launching agents: <skill list>"` + full `phases[]` |
+| 4 | **Phase N commit created** | `phases[N-1].status:"completed"`, `.findingsAfter`, `.filesChanged`, `.commit`, `.commitMessage`, `.durationSeconds`; update `findingsFixed`, `findingsRemaining`, `overallProgress` |
+| 5 | **Verification gate starts** | `currentActivity:"Phase N gate: running tests..."` + full `phases[]` |
+| 6 | **Verification gate completes** | `currentActivity:"Phase N gate: ✅ passed"` or `"Phase N gate: ❌ failed"` + full `phases[]` |
+| 7 | **After documentation commit** | `status:"completed"`, `completedAt`, `deferredIssues[]`, `reportPath`, `issuesPath`, `overallProgress:100`, `currentActivity:"Modernization complete"` |
+
+**Do NOT push on:** individual sub-agent returns, regression check linter re-runs, between batches within a phase step.
+
 ## Operating Principles
 
 1. **Fix every error that has a mapped skill.** Volume is not a reason to defer.
@@ -131,6 +174,8 @@ grep -c " error \| warning " /tmp/ui5-linter-baseline.txt || echo "0"
 
 Parse: total errors/warnings, grouped by rule ID and file. Store for final comparison.
 
+**Dashboard → update #1 (initial state + Phase 1 start):** POST to `http://localhost:3001/api/status` the full initial `ModernizationState`: `status:"running"`, all preflight fields (`project`, `ui5Version`, `verificationMode`, `workingTreeStatus`, `linterBaseline`), `findingsFixed:0`, `overallProgress:0`, `currentPhase:1`, `currentActivity:"Applying UI5 linter autofix"`, the full 5-element `phases[]` array with `phases[0].status:"running"` and `phases[0].findingsBefore` set (rest `"pending"`), `startedAt` and `phaseStartedAt` set to current ISO timestamp, `completedAt:null`.
+
 ### Step 1.2: Apply Autofix
 
 ```bash
@@ -140,13 +185,21 @@ npx @ui5/linter --details 2>&1 | tee /tmp/ui5-linter-post-autofix.txt
 
 ### Step 1.3: Test Starter modernization
 
+**Dashboard → activity:** POST to `http://localhost:3001/api/status` — set `currentActivity:"Modernizing test starter"` + full `phases[]`.
+
 Launch sub-agent with `modernize-test-starter`. Use custom prompt instructing it to: read the skill, run Phase 0 detection completely before changes, follow ALL phases, verify against the 14-item Completion Checklist.
 
 ### Phase 1 commit + gate
 
+**Dashboard → phase complete:** POST to `http://localhost:3001/api/status` — set `phases[0].status:"completed"`, `phases[0].findingsAfter`, `phases[0].filesChanged`, `phases[0].commit`, `phases[0].commitMessage:"chore: apply UI5 linter autofix and modernize test starter"`, `phases[0].durationSeconds`; update `findingsFixed`, `findingsRemaining`, `overallProgress`.
+
 ## Phase 2: Foundation
 
+**Dashboard → phase start:** POST to `http://localhost:3001/api/status` — set `phases[1].status:"running"`, `phases[1].findingsBefore`, `currentPhase:2`, `currentActivity:"Starting Phase 2: Foundation"`, `phaseStartedAt`.
+
 ### Step 2.1: manifest.json
+
+**Dashboard → activity:** POST to `http://localhost:3001/api/status` — set `currentActivity:"Fixing manifest.json"` + full `phases[]`.
 
 Launch sub-agent with `fix-manifest-json`. Pass all `manifest.json` errors from rules: `no-outdated-manifest-version`, `no-legacy-ui5-version-in-manifest`, `no-deprecated-library`, `no-deprecated-component`, `no-removed-manifest-property`, plus `no-deprecated-api` with "view type"/"model type"/"resources/js".
 
@@ -164,13 +217,19 @@ If exit code 1, fix: `imported-interface` → remove from deps, use string liter
 
 ### Phase 2 commit + gate
 
+**Dashboard → phase complete:** POST to `http://localhost:3001/api/status` — set `phases[1].status:"completed"`, `phases[1].findingsAfter`, `phases[1].filesChanged`, `phases[1].commit`, `phases[1].commitMessage:"fix: modernize manifest.json and Component.js"`, `phases[1].durationSeconds`; update `findingsFixed`, `findingsRemaining`, `overallProgress`.
+
 ## Phase 3: Module System & Globals
+
+**Dashboard → phase start:** POST to `http://localhost:3001/api/status` — set `phases[2].status:"running"`, `phases[2].findingsBefore`, `currentPhase:3`, `currentActivity:"Starting Phase 3: Module System & Globals"`, `phaseStartedAt`.
 
 **Strategy:** Three global/module skills run **in parallel** (different files). `fix-linter-blind-spots` and `fix-cyclic-deps` run **sequentially after** (need stable complete JS layer).
 
 **Critical:** Always use sub-agents for Step 3.1. The `fix-js-globals` Key Rules are not in main-agent context.
 
 ### Step 3.1: Parallel batch
+
+**Dashboard → activity:** POST to `http://localhost:3001/api/status` — set `currentActivity:"Launching parallel agents: fix-js-globals, fix-pseudo-modules, fix-xml-globals"` + full `phases[]`.
 
 Launch sub-agents in parallel (up to 8 concurrent):
 - `fix-js-globals` for JS `no-globals` errors + routed `no-deprecated-api` cases
@@ -193,13 +252,19 @@ Launch one sub-agent. Instruct it to: read the skill, build dependency graph, au
 
 ### Phase 3 commit + gate
 
+**Dashboard → phase complete:** POST to `http://localhost:3001/api/status` — set `phases[2].status:"completed"`, `phases[2].findingsAfter`, `phases[2].filesChanged`, `phases[2].commit`, `phases[2].commitMessage:"fix: modernize module system (globals, pseudo-modules, cycles, blind spots)"`, `phases[2].durationSeconds`; update `findingsFixed`, `findingsRemaining`, `overallProgress`.
+
 Re-run linter to verify no regression before committing.
 
 ## Phase 4: Deprecated APIs
 
+**Dashboard → phase start:** POST to `http://localhost:3001/api/status` — set `phases[3].status:"running"`, `phases[3].findingsBefore`, `currentPhase:4`, `currentActivity:"Starting Phase 4: Deprecated APIs"`, `phaseStartedAt`.
+
 **Strategy:** Skills target different rules/files → run **in parallel** by skill. Group errors by skill using the mapping tables, launch one sub-agent per file (or cluster).
 
 ### Execution
+
+**Dashboard → activity:** POST to `http://localhost:3001/api/status` — set `currentActivity:"Launching parallel agents: <list of skills for this batch>"` + full `phases[]`.
 
 Launch sub-agents in parallel (up to 8 concurrent). Use the Sub-Agent Prompt Template. Group files by skill.
 
@@ -209,21 +274,33 @@ Re-run linter. Second batch for new Phase 4 errors only.
 
 ### Phase 4 commit + gate
 
+**Dashboard → phase complete:** POST to `http://localhost:3001/api/status` — set `phases[3].status:"completed"`, `phases[3].findingsAfter`, `phases[3].filesChanged`, `phases[3].commit`, `phases[3].commitMessage:"fix: replace deprecated UI5 APIs"`, `phases[3].durationSeconds`; update `findingsFixed`, `findingsRemaining`, `overallProgress`.
+
 ## Phase 5: CSP Compliance
+
+**Dashboard → phase start:** POST to `http://localhost:3001/api/status` — set `phases[4].status:"running"`, `phases[4].findingsBefore`, `currentPhase:5`, `currentActivity:"Starting Phase 5: CSP Compliance"`, `phaseStartedAt`.
 
 CSP comes last because earlier phases may introduce inline blocks.
 
 **Critical: never delete inline scripts — always externalize.** Move inline code to `.js` file, replace with `<script src="...">`.
 
+**Dashboard → activity:** POST to `http://localhost:3001/api/status` — set `currentActivity:"Externalizing inline scripts for CSP compliance"` + full `phases[]`.
+
 Launch sub-agents for files with `csp-unsafe-inline-script`. Use template with `fix-csp-compliance`.
 
 ### Phase 5 commit + gate
+
+**Dashboard → phase complete:** POST to `http://localhost:3001/api/status` — set `phases[4].status:"completed"`, `phases[4].findingsAfter`, `phases[4].filesChanged`, `phases[4].commit`, `phases[4].commitMessage:"fix: enforce CSP compliance"`, `phases[4].durationSeconds`; update `findingsFixed`, `findingsRemaining`, `overallProgress`.
 
 Final linter run for error count.
 
 ## Verification Gate
 
 After every phase commit, run the gate matching the mode chosen in Phase 0. **Use 600000ms timeout** for all test commands.
+
+**Dashboard → gate start:** Before running the gate, call `update-status` — set `currentActivity:"Phase {N} gate: running tests..."` + full `phases[]`.
+
+**Dashboard → gate result:** After the gate completes, call `update-status` — set `currentActivity:"Phase {N} gate: ✅ passed"` or `"Phase {N} gate: ❌ failed"` + full `phases[]`.
 
 ### Full autonomous
 
@@ -299,6 +376,8 @@ Instructions:
 Create `MODERNIZATION-ISSUES.md` and `MODERNIZATION-REPORT.md` using templates in `references/documentation-templates.md`.
 
 Commit: `docs: add modernization report and issues`
+
+**Dashboard → completion (update #7):** POST to `http://localhost:3001/api/status` with: `status:"completed"`, `completedAt` set to current ISO timestamp, `currentActivity:"Modernization complete — <baseline> → <remaining> findings"`, `overallProgress:100`, `deferredIssues` array (each with `file`, `rule`, `message`, `reason`), `reportPath` and `issuesPath` set to the created file paths, and the full `phases[]` array.
 
 ## Context Management
 
